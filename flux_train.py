@@ -78,6 +78,14 @@ def train(args):
         )
         args.gradient_checkpointing = True
 
+    # Chroma model requirements
+    if args.model_type == "chroma":
+        assert args.apply_t5_attn_mask, "apply_t5_attn_mask must be True for Chroma / Chromaではapply_t5_attn_maskを指定する必要があります"
+    
+    # FLUX model requirements
+    if args.model_type != "chroma" and args.clip_l is None:
+        raise ValueError("--clip_l is required for FLUX models / FLUX モデルには --clip_l が必要です")
+
     assert (
         args.blocks_to_swap is None or args.blocks_to_swap == 0
     ) or not args.cpu_offload_checkpointing, (
@@ -150,7 +158,11 @@ def train(args):
 
     train_dataset_group.verify_bucket_reso_steps(16)  # TODO これでいいか確認
 
-    _, is_schnell, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+    if args.model_type != "chroma":
+        _, is_schnell, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+    else:
+        is_schnell = False  # Chroma is not schnell
+    
     if args.debug_dataset:
         if args.cache_text_encoder_outputs:
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(
@@ -219,7 +231,11 @@ def train(args):
     strategy_base.TokenizeStrategy.set_strategy(flux_tokenize_strategy)
 
     # load clip_l, t5xxl for caching text encoder outputs
-    clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", args.disable_mmap_load_safetensors)
+    if args.model_type != "chroma":
+        clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", args.disable_mmap_load_safetensors)
+    else:
+        clip_l = flux_utils.dummy_clip_l()  # dummy CLIP-L for Chroma
+    
     t5xxl = flux_utils.load_t5xxl(args.t5xxl, weight_dtype, "cpu", args.disable_mmap_load_safetensors)
     clip_l.eval()
     t5xxl.eval()
@@ -271,7 +287,7 @@ def train(args):
 
     # load FLUX
     _, flux = flux_utils.load_flow_model(
-        args.pretrained_model_name_or_path, weight_dtype, "cpu", args.disable_mmap_load_safetensors, model_type="flux"
+        args.pretrained_model_name_or_path, weight_dtype, "cpu", args.disable_mmap_load_safetensors, model_type=args.model_type
     )
 
     if args.gradient_checkpointing:
@@ -639,6 +655,17 @@ def train(args):
                 # get guidance: ensure args.guidance_scale is float
                 guidance_vec = torch.full((bsz,), float(args.guidance_scale), device=accelerator.device)
 
+                # get modulation vectors for Chroma
+                mod_vectors = None
+                if args.model_type == "chroma":
+                    with accelerator.autocast(), torch.no_grad():
+                        mod_vectors = flux.get_mod_vectors(timesteps=timesteps / 1000, guidance=guidance_vec, batch_size=bsz)
+
+                # gradient checkpointing support
+                if args.gradient_checkpointing:
+                    if mod_vectors is not None:
+                        mod_vectors.requires_grad_(True)
+
                 # call model
                 l_pooled, t5_out, txt_ids, t5_attn_mask = text_encoder_conds
                 if not args.apply_t5_attn_mask:
@@ -655,6 +682,7 @@ def train(args):
                         timesteps=timesteps / 1000,
                         guidance=guidance_vec,
                         txt_attention_mask=t5_attn_mask,
+                        mod_vectors=mod_vectors,
                     )
 
                 # unpack latents
